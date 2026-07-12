@@ -26,7 +26,7 @@ WeRead KOReader Plugin - 自动认证配置脚本
   默认插件目录：当前目录下的 weread.koplugin/
 """
 
-import asyncio, json, os, sys
+import asyncio, json, os, re, sys
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -35,9 +35,9 @@ from playwright.async_api import async_playwright
 # 持久化浏览器用户数据目录（保存 cookie、localStorage 等）
 USER_DATA_DIR = Path.home() / ".weread_koplugin_browser"
 
-# 微信读书 API Key（需从微信读书 App 获取）
-# App → 我 → 设置 → 微信读书Skill → API Key
-DEFAULT_API_KEY = "wrk-AMRlBJMsQ92u58oOx2oJOAAA"
+# 占位符 API Key：不是真实凭证，Playwright 抓不到它。
+# 真实 key 只能从微信读书 App 里手动获取：我 → 设置 → 微信读书SKILL → 获取API Key
+PLACEHOLDER_API_KEY = "wrk-AMRlBJMsQ92u58oOx2oJOAAA"
 
 # 超时设置
 LOGIN_TIMEOUT_MS = 120_000
@@ -64,6 +64,31 @@ def find_plugin_dir():
     return Path.cwd()
 
 
+def resolve_api_key(config_path):
+    """决定要写入新 config.lua 的 api_key。
+
+    api_key 拿不到自动化：它只能从微信读书 App 里手动复制，Playwright 抓的是
+    浏览器 cookie，跟这个 key 毫无关系。之前的版本每次都用占位符覆盖
+    config.lua，导致用户手填的真实 key 被静默冲掉（书架/搜索/进度同步全部
+    变成占位符账号的数据）。这里优先复用已有 config.lua 里的真实 key，找不到
+    再提示用户手动输入。
+    """
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        m = re.search(r'api_key\s*=\s*"([^"]*)"', text)
+        if m and m.group(1) and m.group(1) != PLACEHOLDER_API_KEY:
+            print(f"✓ 复用已有 config.lua 中的 api_key（{m.group(1)[:10]}...）")
+            return m.group(1)
+
+    print()
+    print("未找到真实 api_key（获取方式：微信读书 App → 我 → 设置 → 微信读书SKILL → 获取API Key）")
+    api_key = input("请粘贴你的 api_key（留空则用占位符，需要之后手动填写 config.lua）: ").strip()
+    if not api_key:
+        print("⚠ 未输入 api_key，写入的是占位符，浏览书架/搜索/进度同步会失败，请之后手动替换 config.lua 里的 api_key")
+        return PLACEHOLDER_API_KEY
+    return api_key
+
+
 def extract_weread_cookies(cdp_cookies):
     """从 CDP cookie 列表中提取微信读书相关 cookie，返回排序后的 cookie 字符串"""
     parts = {}
@@ -71,6 +96,34 @@ def extract_weread_cookies(cdp_cookies):
         if "weread" in c.get("domain", ""):
             parts[c["name"]] = c["value"]
     return "; ".join([f"{k}={v}" for k, v in sorted(parts.items())])
+
+
+async def get_wr_skey(context, page):
+    """通过 CDP 直接读取 wr_skey cookie（HttpOnly，DOM/JS 均不可见）"""
+    cdp = await context.new_cdp_session(page)
+    try:
+        cdp_cookies = await cdp.send("Network.getAllCookies")
+    finally:
+        await cdp.detach()
+    for c in cdp_cookies.get("cookies", []):
+        if c.get("name") == "wr_skey" and "weread" in c.get("domain", ""):
+            return c.get("value", "")
+    return ""
+
+
+async def wait_for_login(context, page, timeout_ms, poll_interval_s=1.0):
+    """轮询 wr_skey cookie 判断是否已登录，而不是依赖页面上的书籍链接
+    （未登录首页也会展示带 /web/reader/ 链接的推荐书籍，DOM 选择器不可靠）。
+    真正登录成功后，微信读书会签发 wr_skey（长度 >= 8），与插件里
+    Cookie.has_login_cookie 的判断标准保持一致。
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while asyncio.get_running_loop().time() < deadline:
+        wr_skey = await get_wr_skey(context, page)
+        if len(wr_skey) >= 8:
+            return True
+        await asyncio.sleep(poll_interval_s)
+    return False
 
 
 def build_config_lua(api_key, cookie_str, xwrpa_header):
@@ -158,21 +211,21 @@ async def main():
         page = pages[0]
         
         await page.goto("https://weread.qq.com")
-        
-        # 检测是否已登录
-        try:
-            await page.wait_for_selector('a[href*="/web/reader/"]', timeout=5_000)
+
+        # 检测是否已登录：轮询 wr_skey cookie，不依赖页面上的书籍链接
+        # （未登录首页也会展示营销位的推荐书籍，链接同样匹配 /web/reader/，
+        #  用它做登录判断会在还没登录时就误判成功，抓到匿名会话的假 cookie）
+        if await wait_for_login(context, page, timeout_ms=5_000):
             print("✓ 检测到已有登录态（持久化会话生效）")
-        except:
+        else:
             print("→ 请在浏览器中扫码登录微信读书...")
-            try:
-                await page.wait_for_selector('a[href*="/web/reader/"]', timeout=LOGIN_TIMEOUT_MS)
+            if await wait_for_login(context, page, timeout_ms=LOGIN_TIMEOUT_MS):
                 print("✓ 登录成功！会话已保存到磁盘，下次无需重复登录")
-            except:
+            else:
                 print("✗ 登录超时，请重试")
                 await context.close()
                 sys.exit(1)
-        
+
         # 进入一本书的阅读页面，触发 API 请求以获取 x-wrpa-0
         book_href = await page.get_attribute('a[href*="/web/reader/"]', "href")
         print(f"→ 打开书籍: {book_href}")
@@ -219,7 +272,8 @@ async def main():
         print()
         
         # 生成 config.lua
-        config_content = build_config_lua(DEFAULT_API_KEY, cookie_str, wrpa_header)
+        api_key = resolve_api_key(config_path)
+        config_content = build_config_lua(api_key, cookie_str, wrpa_header)
         config_path.write_text(config_content, encoding="utf-8")
         
         print(f"✓ config.lua 已写入: {config_path}")
